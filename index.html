@@ -623,6 +623,7 @@
 
                 state.drivers = drivers;
                 state.lapsData = {};
+                state.positions = positions;
 
                 laps.forEach(lap => {
                     if (!state.lapsData[lap.driver_number]) {
@@ -645,6 +646,16 @@
         function renderStandings() {
             const container = document.getElementById('standings-container');
             
+            // Calcola l'ultima posizione nota per ogni pilota
+            const latestPositionsByDriver = {};
+            (state.positions || []).forEach(pos => {
+                const key = pos.driver_number;
+                const current = latestPositionsByDriver[key];
+                if (!current || new Date(pos.date) > new Date(current.date)) {
+                    latestPositionsByDriver[key] = pos;
+                }
+            });
+
             const driversWithLaps = state.drivers.map(driver => {
                 const driverLaps = state.lapsData[driver.driver_number] || [];
                 const bestLap = driverLaps.reduce((best, lap) => {
@@ -653,18 +664,22 @@
                     return best;
                 }, null);
 
+                const latestPos = latestPositionsByDriver[driver.driver_number];
+
                 return {
                     ...driver,
                     lapCount: driverLaps.length,
-                    bestLap: bestLap?.lap_duration || null
+                    bestLap: bestLap?.lap_duration || null,
+                    racePosition: latestPos ? latestPos.position : null
                 };
             });
 
+            // Ordina per posizione di gara effettiva
             driversWithLaps.sort((a, b) => {
-                if (!a.bestLap && !b.bestLap) return 0;
-                if (!a.bestLap) return 1;
-                if (!b.bestLap) return -1;
-                return a.bestLap - b.bestLap;
+                if (a.racePosition == null && b.racePosition == null) return 0;
+                if (a.racePosition == null) return 1;
+                if (b.racePosition == null) return -1;
+                return a.racePosition - b.racePosition;
             });
 
             const table = document.createElement('table');
@@ -683,7 +698,7 @@
                 <tbody>
                     ${driversWithLaps.map((driver, index) => `
                         <tr data-driver="${driver.driver_number}" class="${state.selectedDrivers.includes(driver.driver_number) ? 'selected' : ''}">
-                            <td>${index + 1}</td>
+                            <td>${driver.racePosition ?? (index + 1)}</td>
                             <td><strong>${driver.driver_number}</strong></td>
                             <td>
                                 <span class="team-colors" style="background: ${getTeamColor(driver.team_name)}"></span>
