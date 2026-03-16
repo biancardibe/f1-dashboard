@@ -466,6 +466,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
         // State management
         const state = {
@@ -477,6 +478,8 @@
             selectedDrivers: [],
             lapsData: {},
             telemetryData: {},
+            carDataCache: {},
+            charts: {},
             currentTab: 'laps',
             updateBuffer: [],
             lastUpdate: Date.now()
@@ -710,9 +713,11 @@
             
             if (index > -1) {
                 state.selectedDrivers.splice(index, 1);
+                delete state.carDataCache[driverNumber];
             } else {
                 if (state.selectedDrivers.length >= 3) {
-                    state.selectedDrivers.shift();
+                    const removed = state.selectedDrivers.shift();
+                    delete state.carDataCache[removed];
                 }
                 state.selectedDrivers.push(driverNumber);
             }
@@ -722,6 +727,10 @@
             
             if (state.selectedDrivers.length > 0) {
                 loadDriverLaps(state.selectedDrivers[state.selectedDrivers.length - 1]);
+            } else {
+                document.getElementById('tab-content-laps').innerHTML = '<div class="empty-state"><p>👆 Seleziona un pilota dalla classifica</p></div>';
+                document.getElementById('tab-content-telemetry').innerHTML = '<div class="empty-state"><p>📊 Seleziona un pilota per visualizzare la telemetria</p></div>';
+                document.getElementById('tab-content-pace').innerHTML = '<div class="empty-state"><p>⏱️ Seleziona piloti per confrontare il passo gara</p></div>';
             }
         }
 
@@ -754,7 +763,7 @@
             }
         };
 
-        function loadDriverLaps(driverNumber) {
+        async function loadDriverLaps(driverNumber) {
             const laps = state.lapsData[driverNumber] || [];
             const container = document.getElementById('tab-content-laps');
 
@@ -783,7 +792,7 @@
                         ${laps.map(lap => {
                             const isValid = lap.is_pit_out_lap === false && lap.lap_duration;
                             return `
-                                <div class="lap-item ${isValid ? '' : 'invalid'}" data-lap="${lap.lap_number}">
+                                <div class="lap-item ${isValid ? '' : 'invalid'}" data-lap="${lap.lap_number}" onclick="loadLapTelemetry(${driverNumber}, ${lap.lap_number})">
                                     <div class="lap-header">
                                         <span class="lap-number">Giro ${lap.lap_number}</span>
                                         <span class="lap-time">${formatTime(lap.lap_duration)}</span>
@@ -802,7 +811,337 @@
             `;
 
             container.innerHTML = html;
+
+            // Load telemetry and pace data
+            await loadTelemetryForDriver(driverNumber);
+            await updatePaceChart();
         }
+
+        async function loadTelemetryForDriver(driverNumber) {
+            if (state.carDataCache[driverNumber]) {
+                renderTelemetryCharts();
+                return;
+            }
+
+            try {
+                const driver = state.drivers.find(d => d.driver_number === driverNumber);
+                const laps = state.lapsData[driverNumber] || [];
+                
+                if (laps.length === 0) return;
+
+                const bestLap = laps.reduce((best, lap) => {
+                    if (lap.is_pit_out_lap) return best;
+                    if (!lap.lap_duration) return best;
+                    if (!best || lap.lap_duration < best.lap_duration) return lap;
+                    return best;
+                }, null);
+
+                if (!bestLap) {
+                    console.log('No valid lap found for driver', driverNumber);
+                    return;
+                }
+
+                console.log('Loading telemetry for driver', driverNumber, 'lap', bestLap.lap_number);
+
+                const carData = await fetchAPI('/car_data', {
+                    session_key: state.selectedSession,
+                    driver_number: driverNumber
+                });
+
+                console.log('Received', carData.length, 'telemetry points');
+
+                if (carData.length === 0) {
+                    console.log('No car data available for driver', driverNumber);
+                    return;
+                }
+
+                const lapStartTime = new Date(bestLap.date_start).getTime();
+                const lapEndTime = lapStartTime + (bestLap.lap_duration * 1000);
+
+                const filteredData = carData.filter(d => {
+                    const pointTime = new Date(d.date).getTime();
+                    return pointTime >= lapStartTime && pointTime <= lapEndTime;
+                });
+
+                console.log('Filtered to', filteredData.length, 'points for lap', bestLap.lap_number);
+
+                state.carDataCache[driverNumber] = {
+                    lapNumber: bestLap.lap_number,
+                    data: filteredData.length > 0 ? filteredData : carData.slice(0, 300)
+                };
+
+                renderTelemetryCharts();
+            } catch (error) {
+                console.error('Error loading telemetry:', error);
+                document.getElementById('tab-content-telemetry').innerHTML = `
+                    <div class="error">Errore nel caricamento della telemetria: ${error.message}</div>
+                `;
+            }
+        }
+
+        function renderTelemetryCharts() {
+            const container = document.getElementById('tab-content-telemetry');
+            
+            if (state.selectedDrivers.length === 0) {
+                container.innerHTML = '<div class="empty-state"><p>📊 Seleziona un pilota per visualizzare la telemetria</p></div>';
+                return;
+            }
+
+            const driversWithData = state.selectedDrivers.filter(dn => {
+                const hasData = state.carDataCache[dn] && state.carDataCache[dn].data && state.carDataCache[dn].data.length > 0;
+                console.log('Driver', dn, 'has data:', hasData, state.carDataCache[dn]);
+                return hasData;
+            });
+            
+            if (driversWithData.length === 0) {
+                const loadingStates = state.selectedDrivers.map(dn => {
+                    const cached = state.carDataCache[dn];
+                    return `Driver ${dn}: ${cached ? 'cached but empty' : 'not loaded'}`;
+                }).join(', ');
+                console.log('No drivers with data:', loadingStates);
+                container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Caricamento telemetria...</p><p style="font-size: 0.75rem; margin-top: 0.5rem;">' + loadingStates + '</p></div>';
+                return;
+            }
+
+            console.log('Rendering charts for drivers:', driversWithData);
+
+            container.innerHTML = `
+                <div style="padding: 1rem;">
+                    <h3 style="margin-bottom: 1rem;">Telemetria - Miglior Giro</h3>
+                    <div style="background: var(--color-bg-elevated); padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                        <canvas id="speed-chart" style="max-height: 250px;"></canvas>
+                    </div>
+                    <div style="background: var(--color-bg-elevated); padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                        <canvas id="throttle-chart" style="max-height: 200px;"></canvas>
+                    </div>
+                    <div style="background: var(--color-bg-elevated); padding: 1rem; border-radius: 8px;">
+                        <canvas id="brake-chart" style="max-height: 200px;"></canvas>
+                    </div>
+                </div>
+            `;
+
+            createTelemetryChart('speed-chart', 'Velocità (km/h)', driversWithData, 'speed');
+            createTelemetryChart('throttle-chart', 'Acceleratore (%)', driversWithData, 'throttle');
+            createTelemetryChart('brake-chart', 'Freno (%)', driversWithData, 'brake');
+        }
+
+        function createTelemetryChart(canvasId, label, driverNumbers, dataKey) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+
+            if (state.charts[canvasId]) {
+                state.charts[canvasId].destroy();
+            }
+
+            const datasets = driverNumbers.map((driverNum, idx) => {
+                const driver = state.drivers.find(d => d.driver_number === driverNum);
+                const carData = state.carDataCache[driverNum]?.data || [];
+                
+                const color = getTeamColor(driver.team_name);
+                const isDuplicate = driverNumbers.slice(0, idx).some(dn => {
+                    const d = state.drivers.find(d => d.driver_number === dn);
+                    return d.team_name === driver.team_name;
+                });
+
+                return {
+                    label: `${driver.broadcast_name || driver.full_name} (Giro ${state.carDataCache[driverNum]?.lapNumber})`,
+                    data: carData.map((d, i) => ({ x: i, y: d[dataKey] || 0 })),
+                    borderColor: color,
+                    backgroundColor: color + '40',
+                    borderWidth: 2,
+                    borderDash: isDuplicate ? [5, 5] : [],
+                    pointRadius: 0,
+                    tension: 0.1
+                };
+            });
+
+            state.charts[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            labels: { color: '#f1f5f9' }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: {
+                                display: true,
+                                text: 'Campioni telemetrici',
+                                color: '#cbd5e1'
+                            },
+                            ticks: { color: '#94a3b8' },
+                            grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: label,
+                                color: '#cbd5e1'
+                            },
+                            ticks: { color: '#94a3b8' },
+                            grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        async function updatePaceChart() {
+            const container = document.getElementById('tab-content-pace');
+            
+            if (state.selectedDrivers.length === 0) {
+                container.innerHTML = '<div class="empty-state"><p>⏱️ Seleziona piloti per confrontare il passo gara</p></div>';
+                return;
+            }
+
+            const driversData = state.selectedDrivers.map(driverNum => {
+                const driver = state.drivers.find(d => d.driver_number === driverNum);
+                const laps = (state.lapsData[driverNum] || [])
+                    .filter(lap => lap.lap_duration && !lap.is_pit_out_lap)
+                    .map(lap => ({
+                        lap: lap.lap_number,
+                        time: lap.lap_duration
+                    }));
+
+                const last5 = laps.slice(-5);
+                const avgLast5 = last5.length > 0 
+                    ? last5.reduce((sum, l) => sum + l.time, 0) / last5.length 
+                    : 0;
+                
+                const stdDev = last5.length > 1
+                    ? Math.sqrt(last5.reduce((sum, l) => sum + Math.pow(l.time - avgLast5, 2), 0) / last5.length)
+                    : 0;
+
+                return {
+                    driver,
+                    laps,
+                    avgLast5,
+                    stdDev,
+                    bestLap: laps.length > 0 ? Math.min(...laps.map(l => l.time)) : 0
+                };
+            });
+
+            container.innerHTML = `
+                <div style="padding: 1rem;">
+                    <h3 style="margin-bottom: 1rem;">Passo Gara - Confronto</h3>
+                    
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+                        ${driversData.map(dd => `
+                            <div style="background: var(--color-bg-elevated); padding: 1rem; border-radius: 8px; border-left: 3px solid ${getTeamColor(dd.driver.team_name)};">
+                                <div style="font-weight: 600; margin-bottom: 0.5rem;">${dd.driver.broadcast_name || dd.driver.full_name}</div>
+                                <div style="font-size: 0.875rem; color: var(--color-text-secondary);">
+                                    <div>Media ultimi 5: <strong style="font-family: 'Courier New', monospace;">${formatTime(dd.avgLast5)}</strong></div>
+                                    <div>Std Dev: <strong>${dd.stdDev.toFixed(3)}s</strong></div>
+                                    <div>Miglior giro: <strong style="font-family: 'Courier New', monospace;">${formatTime(dd.bestLap)}</strong></div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+
+                    <div style="background: var(--color-bg-elevated); padding: 1rem; border-radius: 8px;">
+                        <canvas id="pace-chart" style="max-height: 350px;"></canvas>
+                    </div>
+                </div>
+            `;
+
+            createPaceChart(driversData);
+        }
+
+        function createPaceChart(driversData) {
+            const ctx = document.getElementById('pace-chart');
+            if (!ctx) return;
+
+            if (state.charts['pace-chart']) {
+                state.charts['pace-chart'].destroy();
+            }
+
+            const datasets = driversData.map((dd, idx) => {
+                const color = getTeamColor(dd.driver.team_name);
+                const isDuplicate = driversData.slice(0, idx).some(d => d.driver.team_name === dd.driver.team_name);
+
+                return {
+                    label: dd.driver.broadcast_name || dd.driver.full_name,
+                    data: dd.laps.map(l => ({ x: l.lap, y: l.time })),
+                    borderColor: color,
+                    backgroundColor: color + '40',
+                    borderWidth: 2,
+                    borderDash: isDuplicate ? [5, 5] : [],
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    tension: 0.2
+                };
+            });
+
+            state.charts['pace-chart'] = new Chart(ctx, {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            labels: { color: '#f1f5f9' }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => {
+                                    return `${context.dataset.label}: ${formatTime(context.parsed.y)}`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: {
+                                display: true,
+                                text: 'Numero Giro',
+                                color: '#cbd5e1'
+                            },
+                            ticks: { 
+                                color: '#94a3b8',
+                                stepSize: 1
+                            },
+                            grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Tempo Giro (s)',
+                                color: '#cbd5e1'
+                            },
+                            ticks: { 
+                                color: '#94a3b8',
+                                callback: (value) => formatTime(value)
+                            },
+                            grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        window.loadLapTelemetry = async function(driverNumber, lapNumber) {
+            document.querySelectorAll('.lap-item').forEach(item => item.classList.remove('selected'));
+            event.currentTarget.classList.add('selected');
+            
+            state.currentTab = 'telemetry';
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('[data-tab="telemetry"]').classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+            document.getElementById('tab-content-telemetry').style.display = 'block';
+
+            await loadTelemetryForDriver(driverNumber);
+        };
 
         function updateSessionStatus() {
             const badge = document.getElementById('session-status');
